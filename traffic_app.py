@@ -1,1180 +1,345 @@
-# # # # # # traffic_manager_full.py
-# # # # # import streamlit as st
-# # # # # import cv2
-# # # # # import time
-# # # # # import tempfile
-# # # # # import os
-# # # # # import random
-# # # # # from collections import deque, OrderedDict
-# # # # # import numpy as np
-# # # # # import threading
-# # # # # import requests
-
-# # # # # # ----------------------------
-# # # # # # Centroid Tracker
-# # # # # # ----------------------------
-# # # # # class CentroidTracker:
-# # # # #     def __init__(self, max_disappeared=30, max_distance=60):
-# # # # #         self.nextObjectID = 0
-# # # # #         self.objects = OrderedDict()
-# # # # #         self.disappeared = OrderedDict()
-# # # # #         self.max_disappeared = max_disappeared
-# # # # #         self.max_distance = max_distance
-# # # # #         self.history = {}  # id -> list of (timestamp, centroid)
-
-# # # # #     def register(self, centroid, timestamp=None):
-# # # # #         oid = self.nextObjectID
-# # # # #         self.nextObjectID += 1
-# # # # #         self.objects[oid] = centroid
-# # # # #         self.disappeared[oid] = 0
-# # # # #         t = timestamp if timestamp else time.time()
-# # # # #         self.history[oid] = [(t, centroid)]
-# # # # #         return oid
-
-# # # # #     def deregister(self, oid):
-# # # # #         if oid in self.objects:
-# # # # #             del self.objects[oid]
-# # # # #         if oid in self.disappeared:
-# # # # #             del self.disappeared[oid]
-# # # # #         if oid in self.history:
-# # # # #             del self.history[oid]
-
-# # # # #     def update(self, input_centroids, timestamp=None):
-# # # # #         if timestamp is None:
-# # # # #             timestamp = time.time()
-# # # # #         if len(input_centroids) == 0:
-# # # # #             for oid in list(self.disappeared.keys()):
-# # # # #                 self.disappeared[oid] += 1
-# # # # #                 if self.disappeared[oid] > self.max_disappeared:
-# # # # #                     self.deregister(oid)
-# # # # #             return self.objects
-
-# # # # #         if len(self.objects) == 0:
-# # # # #             for c in input_centroids:
-# # # # #                 self.register(c, timestamp)
-# # # # #             return self.objects
-
-# # # # #         objectIDs = list(self.objects.keys())
-# # # # #         objectCentroids = list(self.objects.values())
-# # # # #         D = np.linalg.norm(np.array(objectCentroids)[:, None, :] - np.array(input_centroids)[None, :, :], axis=2)
-# # # # #         rows = D.min(axis=1).argsort()
-# # # # #         cols = D.argmin(axis=1)[rows]
-
-# # # # #         usedRows, usedCols = set(), set()
-# # # # #         for (r, c) in zip(rows, cols):
-# # # # #             if r in usedRows or c in usedCols:
-# # # # #                 continue
-# # # # #             if D[r, c] > self.max_distance:
-# # # # #                 continue
-# # # # #             oid = objectIDs[r]
-# # # # #             self.objects[oid] = tuple(input_centroids[c])
-# # # # #             self.disappeared[oid] = 0
-# # # # #             self.history[oid].append((timestamp, tuple(input_centroids[c])))
-# # # # #             usedRows.add(r)
-# # # # #             usedCols.add(c)
-
-# # # # #         unusedRows = set(range(D.shape[0])).difference(usedRows)
-# # # # #         unusedCols = set(range(D.shape[1])).difference(usedCols)
-
-# # # # #         for r in unusedRows:
-# # # # #             oid = objectIDs[r]
-# # # # #             self.disappeared[oid] += 1
-# # # # #             if self.disappeared[oid] > self.max_disappeared:
-# # # # #                 self.deregister(oid)
-
-# # # # #         for c in unusedCols:
-# # # # #             self.register(tuple(input_centroids[c]), timestamp)
-
-# # # # #         return self.objects
-
-# # # # # # ----------------------------
-# # # # # # Simple detector using background subtraction
-# # # # # # ----------------------------
-# # # # # class Detector:
-# # # # #     def __init__(self):
-# # # # #         self.bg = cv2.createBackgroundSubtractorMOG2(history=400, varThreshold=25, detectShadows=True)
-
-# # # # #     def detect(self, frame):
-# # # # #         mask = self.bg.apply(frame)
-# # # # #         _, mask = cv2.threshold(mask, 254, 255, cv2.THRESH_BINARY)
-# # # # #         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
-# # # # #         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-# # # # #         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-# # # # #         boxes = []
-# # # # #         for cnt in contours:
-# # # # #             if cv2.contourArea(cnt) < 800:
-# # # # #                 continue
-# # # # #             x, y, w_, h_ = cv2.boundingRect(cnt)
-# # # # #             boxes.append((x, y, x+w_, y+h_))
-# # # # #         return boxes
-
-# # # # # def box_centroid(box):
-# # # # #     x1,y1,x2,y2 = box
-# # # # #     return (int((x1+x2)/2), int((y1+y2)/2))
-
-# # # # # # ----------------------------
-# # # # # # Traffic management functions
-# # # # # # ----------------------------
-# # # # # def compute_next_green(queues, starvation, min_g, max_g):
-# # # # #     # Add starvation factor
-# # # # #     scores = {}
-# # # # #     for d, q in queues.items():
-# # # # #         scores[d] = q + starvation[d]
-# # # # #     # Choose highest score
-# # # # #     next_dir = max(scores, key=scores.get)
-# # # # #     # compute proportional green
-# # # # #     total_q = sum(queues.values())
-# # # # #     if total_q == 0:
-# # # # #         return next_dir, 0
-# # # # #     frac = queues[next_dir]/total_q
-# # # # #     green_time = max(min_g, min(max_g, int(frac*(min_g+max_g))))
-# # # # #     return next_dir, green_time
-
-# # # # # # ----------------------------
-# # # # # # UI Setup
-# # # # # # ----------------------------
-# # # # # st.set_page_config(layout="wide", page_title="TrafficManagerAI — Full")
-# # # # # st.title("🚦 TrafficManagerAI — Proportional + Starvation Traffic Manager")
-
-# # # # # # Sidebar
-# # # # # st.sidebar.header("Settings")
-# # # # # min_green = st.sidebar.number_input("Min green (s)", 3, 60, 8)
-# # # # # max_green = st.sidebar.number_input("Max green (s)", 5, 120, 40)
-# # # # # starvation_weight = st.sidebar.slider("Starvation weight", 0.0, 1.0, 0.5, 0.05)
-# # # # # strategy = st.sidebar.selectbox("Strategy", ["proportional_starvation"])
-# # # # # uploaded = st.sidebar.file_uploader("Upload video", type=['mp4','avi','mov'])
-# # # # # use_sample = st.sidebar.checkbox("Use sample video (temp_video.mp4)")
-# # # # # start_btn = st.sidebar.button("Start Controller")
-# # # # # stop_btn = st.sidebar.button("Stop Controller")
-
-# # # # # # ----------------------------
-# # # # # # Session State
-# # # # # # ----------------------------
-# # # # # if "ctrl" not in st.session_state:
-# # # # #     st.session_state.ctrl = {
-# # # # #         "running": False,
-# # # # #         "queues": {"North":0,"East":0,"South":0,"West":0},
-# # # # #         "counts": {"North":0,"East":0,"South":0,"West":0},
-# # # # #         "history": {"North":deque(maxlen=60),"East":deque(maxlen=60),
-# # # # #                     "South":deque(maxlen=60),"West":deque(maxlen=60)},
-# # # # #         "current_green": "North",
-# # # # #         "remaining": 0,
-# # # # #         "last_switch": time.time(),
-# # # # #         "starvation": {"North":0,"East":0,"South":0,"West":0},
-# # # # #         "cap": None
-# # # # #     }
-
-# # # # # # ----------------------------
-# # # # # # Video setup
-# # # # # # ----------------------------
-# # # # # cap = None
-# # # # # if uploaded:
-# # # # #     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-# # # # #     tmp.write(uploaded.getbuffer())
-# # # # #     tmp.close()
-# # # # #     st.session_state.ctrl["cap"] = cv2.VideoCapture(tmp.name)
-# # # # # elif use_sample:
-# # # # #     sample = "temp_video.mp4"
-# # # # #     if os.path.exists(sample):
-# # # # #         st.session_state.ctrl["cap"] = cv2.VideoCapture(sample)
-# # # # #     else:
-# # # # #         st.sidebar.error("Sample video not found")
-# # # # # else:
-# # # # #     st.info("Upload a video or enable sample")
-# # # # #     st.stop()
-
-# # # # # cap = st.session_state.ctrl["cap"]
-# # # # # detector = Detector()
-# # # # # tracker = CentroidTracker(max_disappeared=30, max_distance=70)
-
-# # # # # # ----------------------------
-# # # # # # Placeholders
-# # # # # # ----------------------------
-# # # # # col1, col2 = st.columns([2,1])
-# # # # # video_box = col1.empty()
-# # # # # signal_box = col2.empty()
-# # # # # remaining_box = col2.empty()
-# # # # # queue_boxes = {d: col2.empty() for d in ["North","East","South","West"]}
-
-# # # # # # ----------------------------
-# # # # # # Traffic Light HTML
-# # # # # # ----------------------------
-# # # # # def draw_signal_html(current):
-# # # # #     html = "<div style='display:flex;flex-direction:column;gap:6px'>"
-# # # # #     for d in ["North","East","South","West"]:
-# # # # #         color = "green" if current==d else "gray"
-# # # # #         html += f"<div style='padding:6px;background:#111827;color:white;border-radius:6px;'><span style='display:inline-block;width:20px;height:20px;background:{color};border-radius:50%;margin-right:6px'></span>{d}</div>"
-# # # # #     html += "</div>"
-# # # # #     return html
-
-# # # # # # ----------------------------
-# # # # # # Main loop
-# # # # # # ----------------------------
-# # # # # fps = cap.get(cv2.CAP_PROP_FPS) or 25
-# # # # # frame_interval = 1.0 / max(1.0, fps)
-
-# # # # # running = start_btn or st.session_state.ctrl["running"]
-# # # # # st.session_state.ctrl["running"] = running
-
-# # # # # while cap.isOpened() and st.session_state.ctrl["running"]:
-# # # # #     t_start = time.time()
-# # # # #     ret, frame = cap.read()
-# # # # #     if not ret:
-# # # # #         break
-# # # # #     h, w = frame.shape[:2]
-
-# # # # #     # Detect vehicles
-# # # # #     boxes = detector.detect(frame)
-# # # # #     centroids = [box_centroid(b) for b in boxes]
-# # # # #     objects = tracker.update(centroids)
-
-# # # # #     # Count queues
-# # # # #     per_direction_counts = {"North":0,"East":0,"South":0,"West":0}
-# # # # #     per_direction_queues = {"North":0,"East":0,"South":0,"West":0}
-
-# # # # #     for oid, centroid in objects.items():
-# # # # #         x, y = centroid
-# # # # #         # simple heuristic
-# # # # #         if y < h*0.35:
-# # # # #             dir_ = "North"
-# # # # #         elif y > h*0.65:
-# # # # #             dir_ = "South"
-# # # # #         elif x < w*0.45:
-# # # # #             dir_ = "West"
-# # # # #         elif x > w*0.55:
-# # # # #             dir_ = "East"
-# # # # #         else:
-# # # # #             dir_ = "North"
-# # # # #         per_direction_counts[dir_] += 1
-
-# # # # #         if dir_=="North" and y < h*0.45:
-# # # # #             per_direction_queues["North"] += 1
-# # # # #         elif dir_=="South" and y > h*0.55:
-# # # # #             per_direction_queues["South"] += 1
-# # # # #         elif dir_=="West" and x < w*0.45:
-# # # # #             per_direction_queues["West"] += 1
-# # # # #         elif dir_=="East" and x > w*0.55:
-# # # # #             per_direction_queues["East"] += 1
-
-# # # # #         cv2.circle(frame, (int(centroid[0]), int(centroid[1])), 3, (0,255,0), -1)
-
-# # # # #     st.session_state.ctrl["queues"] = per_direction_queues
-# # # # #     st.session_state.ctrl["counts"] = per_direction_counts
-
-# # # # #     # update starvation counters
-# # # # #     for d in ["North","East","South","West"]:
-# # # # #         if per_direction_queues[d]==0:
-# # # # #             st.session_state.ctrl["starvation"][d] += starvation_weight
-# # # # #         else:
-# # # # #             st.session_state.ctrl["starvation"][d] = 0
-
-# # # # #     # Controller logic
-# # # # #     if st.session_state.ctrl["remaining"] <= 0:
-# # # # #         next_dir, green_time = compute_next_green(per_direction_queues,
-# # # # #                                                   st.session_state.ctrl["starvation"],
-# # # # #                                                   min_green,
-# # # # #                                                   max_green)
-# # # # #         st.session_state.ctrl["current_green"] = next_dir
-# # # # #         st.session_state.ctrl["remaining"] = green_time
-# # # # #         st.session_state.ctrl["last_switch"] = time.time()
-# # # # #     else:
-# # # # #         elapsed = time.time() - st.session_state.ctrl["last_switch"]
-# # # # #         st.session_state.ctrl["remaining"] = max(0, st.session_state.ctrl["remaining"] - elapsed)
-# # # # #         st.session_state.ctrl["last_switch"] = time.time()
-
-# # # # #     # Overlay info
-# # # # #     overlay = frame.copy()
-# # # # #     y0 = 30
-# # # # #     for d in ["North","East","South","West"]:
-# # # # #         text = f"{d}: Q={per_direction_queues[d]} C={per_direction_counts[d]}"
-# # # # #         cv2.putText(overlay, text, (10,y0), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255),1)
-# # # # #         y0 += 25
-# # # # #     cv2.putText(overlay, f"GREEN: {st.session_state.ctrl['current_green']} ({int(st.session_state.ctrl['remaining'])}s)",
-# # # # #                 (10,y0+5), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,0), 2)
-
-# # # # #     video_box.image(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB), channels="RGB", width=720)
-# # # # #     signal_box.markdown(draw_signal_html(st.session_state.ctrl["current_green"]), unsafe_allow_html=True)
-# # # # #     remaining_box.text(f"Remaining (s): {int(st.session_state.ctrl['remaining'])}")
-# # # # #     for d in ["North","East","South","West"]:
-# # # # #         queue_boxes[d].text(f"{d} queue: {per_direction_queues[d]}")
-
-# # # # #     t_elapsed = time.time() - t_start
-# # # # #     time.sleep(max(0, frame_interval - t_elapsed))
-
-# # # # # cap.release()
-# # # # # st.success("Processing finished.")
-
-
-
-
-# # # # # traffic_manager_complete.py
-# # # # import os, time, tempfile, threading
-# # # # from collections import deque, OrderedDict
-# # # # import cv2, numpy as np, streamlit as st, plotly.express as px
-# # # # try:
-# # # #     from ultralytics import YOLO
-# # # #     HAS_ULTRALYTICS = True
-# # # # except:
-# # # #     HAS_ULTRALYTICS = False
-# # # # import requests
-
-# # # # # ----------------------------
-# # # # # Centroid Tracker
-# # # # # ----------------------------
-# # # # class CentroidTracker:
-# # # #     def __init__(self, max_disappeared=30, max_distance=60):
-# # # #         self.nextObjectID = 0
-# # # #         self.objects = OrderedDict()
-# # # #         self.disappeared = OrderedDict()
-# # # #         self.max_disappeared = max_disappeared
-# # # #         self.max_distance = max_distance
-# # # #         self.history = {}
-
-# # # #     def register(self, centroid, timestamp=None):
-# # # #         oid = self.nextObjectID
-# # # #         self.nextObjectID += 1
-# # # #         self.objects[oid] = centroid
-# # # #         self.disappeared[oid] = 0
-# # # #         t = timestamp if timestamp else time.time()
-# # # #         self.history[oid] = [(t, centroid)]
-# # # #         return oid
-
-# # # #     def deregister(self, oid):
-# # # #         for d in [self.objects, self.disappeared, self.history]:
-# # # #             if oid in d: del d[oid]
-
-# # # #     def update(self, input_centroids, timestamp=None):
-# # # #         timestamp = timestamp or time.time()
-# # # #         if len(input_centroids)==0:
-# # # #             for oid in list(self.disappeared.keys()):
-# # # #                 self.disappeared[oid] +=1
-# # # #                 if self.disappeared[oid] > self.max_disappeared:
-# # # #                     self.deregister(oid)
-# # # #             return self.objects
-# # # #         if len(self.objects)==0:
-# # # #             for c in input_centroids:
-# # # #                 self.register(c,timestamp)
-# # # #             return self.objects
-
-# # # #         objectIDs = list(self.objects.keys())
-# # # #         objectCentroids = list(self.objects.values())
-# # # #         D = np.linalg.norm(np.array(objectCentroids)[:,None,:] - np.array(input_centroids)[None,:,:], axis=2)
-# # # #         rows = D.min(axis=1).argsort()
-# # # #         cols = D.argmin(axis=1)[rows]
-
-# # # #         usedRows, usedCols = set(), set()
-# # # #         for r,c in zip(rows,cols):
-# # # #             if r in usedRows or c in usedCols: continue
-# # # #             if D[r,c] > self.max_distance: continue
-# # # #             oid = objectIDs[r]
-# # # #             self.objects[oid] = tuple(input_centroids[c])
-# # # #             self.disappeared[oid] = 0
-# # # #             self.history[oid].append((timestamp, tuple(input_centroids[c])))
-# # # #             usedRows.add(r)
-# # # #             usedCols.add(c)
-
-# # # #         unusedRows = set(range(D.shape[0])).difference(usedRows)
-# # # #         unusedCols = set(range(D.shape[1])).difference(usedCols)
-# # # #         for r in unusedRows:
-# # # #             oid = objectIDs[r]
-# # # #             self.disappeared[oid]+=1
-# # # #             if self.disappeared[oid]>self.max_disappeared:
-# # # #                 self.deregister(oid)
-# # # #         for c in unusedCols:
-# # # #             self.register(tuple(input_centroids[c]), timestamp)
-# # # #         return self.objects
-
-# # # # # ----------------------------
-# # # # # Utility
-# # # # # ----------------------------
-# # # # def box_centroid(box): 
-# # # #     x1,y1,x2,y2 = box[:4]
-# # # #     return (int((x1+x2)/2), int((y1+y2)/2))
-
-# # # # def get_direction(p1,p2,threshold=2):
-# # # #     dx,dy = p2[0]-p1[0], p2[1]-p1[1]
-# # # #     if abs(dx)<threshold and abs(dy)<threshold: return None
-# # # #     if abs(dx)>abs(dy): return 'East' if dx>0 else 'West'
-# # # #     else: return 'South' if dy>0 else 'North'
-
-# # # # # ----------------------------
-# # # # # Detector
-# # # # # ----------------------------
-# # # # class Detector:
-# # # #     def __init__(self,yolo_weights=None,conf=0.25):
-# # # #         self.use_yolo = False
-# # # #         self.conf = conf
-# # # #         if HAS_ULTRALYTICS and yolo_weights:
-# # # #             try: self.model = YOLO(yolo_weights); self.use_yolo=True
-# # # #             except: self.model=None; self.use_yolo=False
-# # # #         else: self.model=None; self.use_yolo=False
-# # # #         self.bg = cv2.createBackgroundSubtractorMOG2(history=400,varThreshold=25,detectShadows=True)
-
-# # # #     def detect(self,frame):
-# # # #         h,w = frame.shape[:2]; boxes_out=[]
-# # # #         if self.use_yolo and self.model:
-# # # #             try:
-# # # #                 res = self.model(frame)[0]
-# # # #                 for b in res.boxes:
-# # # #                     xyxy = b.xyxy[0].cpu().numpy() if hasattr(b,"xyxy") else b.xyxy.cpu().numpy()
-# # # #                     x1,y1,x2,y2 = map(int,xyxy[:4])
-# # # #                     conf = float(b.conf[0]) if hasattr(b,"conf") else float(b.conf)
-# # # #                     cls = int(b.cls[0]) if hasattr(b,"cls") else int(b.cls)
-# # # #                     name = res.names[cls] if hasattr(res,"names") else str(cls)
-# # # #                     if name in ('car','truck','bus','motorbike','motorcycle'):
-# # # #                         boxes_out.append((x1,y1,x2,y2,name,conf))
-# # # #                 return boxes_out
-# # # #             except: pass
-# # # #         # Fallback
-# # # #         mask = self.bg.apply(frame)
-# # # #         _, mask = cv2.threshold(mask,254,255,cv2.THRESH_BINARY)
-# # # #         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(5,5)))
-# # # #         contours,_ = cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
-# # # #         for cnt in contours:
-# # # #             if cv2.contourArea(cnt)<800: continue
-# # # #             x,y,w_,h_ = cv2.boundingRect(cnt)
-# # # #             boxes_out.append((x,y,x+w_,y+h_,'vehicle',0.9))
-# # # #         return boxes_out
-
-# # # # # ----------------------------
-# # # # # Streamlit App
-# # # # # ----------------------------
-# # # # st.set_page_config(layout="wide", page_title="TrafficManagerAI Hybrid")
-# # # # st.title("🚦 TrafficManagerAI — Hybrid Traffic Manager")
-
-# # # # # CSS
-# # # # st.markdown("""
-# # # # <style>
-# # # # .signal {display:flex;align-items:center;gap:8px;padding:8px;border-radius:8px;background:#111827;color:white;}
-# # # # .light {width:28px;height:28px;border-radius:50%;margin-right:6px;}
-# # # # .dircard {padding:8px;border-radius:8px;background:#f4f4f6;margin-bottom:6px;}
-# # # # .small {font-size:0.9rem;color:#666;}
-# # # # </style>
-# # # # """, unsafe_allow_html=True)
-
-# # # # # ----------------------------
-# # # # # Sidebar
-# # # # # ----------------------------
-# # # # st.sidebar.header("Inputs & Controls")
-# # # # uploaded = st.sidebar.file_uploader("Upload video", type=['mp4','avi','mov','mkv'])
-# # # # use_sample = st.sidebar.checkbox("Use sample video (temp_video.mp4)", value=False)
-# # # # yolo_weights = st.sidebar.text_input("YOLO weights path (optional)", "yolov11n.pt")
-# # # # conf = st.sidebar.slider("Detection confidence",0.01,1.0,0.25)
-# # # # min_green = st.sidebar.number_input("Min green (s)", 5, 60, 8)
-# # # # max_green = st.sidebar.number_input("Max green (s)", 5, 120, 35)
-# # # # strategy = st.sidebar.selectbox("Strategy", ["hybrid","proportional_live_queues","round_robin"])
-# # # # starvation_weight = st.sidebar.slider("Starvation weight",0.0,2.0,1.0,0.01)
-# # # # enable_api = st.sidebar.checkbox("Enable API POST", value=False)
-# # # # api_url = st.sidebar.text_input("API endpoint", "http://127.0.0.1:5000/signal")
-# # # # start_btn = st.sidebar.button("Start Controller")
-# # # # stop_btn = st.sidebar.button("Stop Controller")
-
-# # # # # ----------------------------
-# # # # # Controller State
-# # # # # ----------------------------
-# # # # if 'ctrl' not in st.session_state:
-# # # #     st.session_state.ctrl = {
-# # # #         'running': False, 'current_green':'North', 'remaining':0, 'last_switch':time.time(),
-# # # #         'queues': {'North':0,'East':0,'South':0,'West':0},
-# # # #         'counts': {'North':0,'East':0,'South':0,'West':0},
-# # # #         'history': {d:deque(maxlen=60) for d in ['North','East','South','West']},
-# # # #     }
-
-# # # # def send_api(direction,duration):
-# # # #     if not enable_api or not api_url: return
-# # # #     payload = {'direction':direction,'action':'GREEN','duration':duration,'ts':time.time()}
-# # # #     def _post():
-# # # #         try: requests.post(api_url,json=payload,timeout=2)
-# # # #         except: pass
-# # # #     threading.Thread(target=_post,daemon=True).start()
-
-# # # # def compute_green_alloc(queues,min_g=min_green,max_g=max_green,starvation=1.0):
-# # # #     total = sum(queues.values()) or 1
-# # # #     times={}
-# # # #     for k,v in queues.items():
-# # # #         frac = v/total
-# # # #         t = int(max(min_g,min(max_g, round(frac*(min_g+max_g) + starvation))))
-# # # #         times[k]=t
-# # # #     return times
-
-# # # # # ----------------------------
-# # # # # Video
-# # # # # ----------------------------
-# # # # video_path = None
-# # # # cap = None
-# # # # tempfile_path=None
-# # # # if uploaded: 
-# # # #     tmp = tempfile.NamedTemporaryFile(delete=False,suffix=".mp4"); tmp.write(uploaded.getbuffer()); tmp.close()
-# # # #     video_path = tmp.name; tempfile_path=tmp.name; cap=cv2.VideoCapture(video_path)
-# # # # elif use_sample and os.path.exists("temp_video.mp4"): video_path="temp_video.mp4"; cap=cv2.VideoCapture(video_path)
-# # # # if cap is None or not cap.isOpened(): st.info("Upload a video or enable sample mode"); st.stop()
-
-# # # # detector = Detector(yolo_weights if yolo_weights else None, conf=conf)
-# # # # tracker = CentroidTracker(max_disappeared=30,max_distance=70)
-# # # # fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-# # # # frame_interval = 1.0 / max(1.0,fps)
-# # # # col1,col2 = st.columns([2,1])
-# # # # video_box = col1.empty()
-
-# # # # # Signal HTML
-# # # # def draw_signal_html(current):
-# # # #     html="<div style='display:flex;flex-direction:column;gap:8px;'>"
-# # # #     for d in ['North','East','South','West']:
-# # # #         color='green' if current==d else 'gray'
-# # # #         html+=f"<div class='signal'><div class='light' style='background:{color}'></div><div><b>{d}</b></div></div>"
-# # # #     html+="</div>"
-# # # #     return html
-
-# # # # # Start / Stop
-# # # # if start_btn: st.session_state.ctrl['running']=True
-# # # # if stop_btn: st.session_state.ctrl['running']=False
-
-# # # # # ----------------------------
-# # # # # Main Loop
-# # # # # ----------------------------
-# # # # while cap.isOpened():
-# # # #     t_start = time.time()
-# # # #     ret, frame = cap.read()
-# # # #     if not ret: break
-# # # #     h,w = frame.shape[:2]
-
-# # # #     boxes = detector.detect(frame)
-# # # #     centroids = [box_centroid(b) for b in boxes]
-# # # #     objects = tracker.update(centroids,time.time())
-
-# # # #     per_counts = {d:0 for d in ['North','East','South','West']}
-# # # #     per_queues = {d:0 for d in ['North','East','South','West']}
-
-# # # #     for oid, centroid in objects.items():
-# # # #         hist = tracker.history.get(oid,[])
-# # # #         dir_assigned = None
-# # # #         if len(hist)>=2: dir_assigned=get_direction(hist[-2][1],hist[-1][1])
-# # # #         if dir_assigned is None:
-# # # #             x,y=centroid
-# # # #             if y<h*0.35: dir_assigned='North'
-# # # #             elif y>h*0.65: dir_assigned='South'
-# # # #             elif x<w*0.4: dir_assigned='West'
-# # # #             elif x>w*0.6: dir_assigned='East'
-# # # #             else: dir_assigned='North'
-# # # #         per_counts[dir_assigned]+=1
-# # # #         # queue heuristic
-# # # #         x,y=centroid
-# # # #         if dir_assigned=='North' and y<h*0.45: per_queues['North']+=1
-# # # #         if dir_assigned=='South' and y>h*0.55: per_queues['South']+=1
-# # # #         if dir_assigned=='West' and x<w*0.45: per_queues['West']+=1
-# # # #         if dir_assigned=='East' and x>w*0.55: per_queues['East']+=1
-# # # #         cv2.circle(frame,centroid,3,(0,255,0),-1)
-# # # #         cv2.putText(frame,f"ID{oid}",(centroid[0]+6,centroid[1]-6),cv2.FONT_HERSHEY_SIMPLEX,0.4,(255,255,255),1)
-
-# # # #     st.session_state.ctrl['queues']=per_queues
-# # # #     st.session_state.ctrl['counts']=per_counts
-# # # #     for d in ['North','East','South','West']: st.session_state.ctrl['history'][d].append(per_queues[d])
-
-# # # #     # Controller logic
-# # # #     if st.session_state.ctrl['running']:
-# # # #         if st.session_state.ctrl['remaining']<=0:
-# # # #             times=compute_green_alloc(st.session_state.ctrl['queues'],min_g=min_green,max_g=max_green,starvation=starvation_weight)
-# # # #             next_dir=max(times,key=lambda k:st.session_state.ctrl['queues'][k])
-# # # #             st.session_state.ctrl['current_green']=next_dir
-# # # #             st.session_state.ctrl['remaining']=times[next_dir]
-# # # #             st.session_state.ctrl['last_switch']=time.time()
-# # # #             send_api(next_dir,st.session_state.ctrl['remaining'])
-# # # #         else:
-# # # #             elapsed=time.time()-st.session_state.ctrl['last_switch']
-# # # #             st.session_state.ctrl['remaining']=max(0,st.session_state.ctrl['remaining']-elapsed)
-# # # #             st.session_state.ctrl['last_switch']=time.time()
-# # # #         if st.session_state.ctrl['remaining']<=0:
-# # # #             times=compute_green_alloc(st.session_state.ctrl['queues'],min_g=min_green,max_g=max_green,starvation=starvation_weight)
-# # # #             next_dir=max(times,key=lambda k:st.session_state.ctrl['queues'][k])
-# # # #             st.session_state.ctrl['current_green']=next_dir
-# # # #             st.session_state.ctrl['remaining']=times[next_dir]
-# # # #             st.session_state.ctrl['last_switch']=time.time()
-# # # #             send_api(next_dir,st.session_state.ctrl['remaining'])
-
-# # # #     # Overlay
-# # # #     overlay = frame.copy()
-# # # #     cv2.rectangle(overlay,(8,8),(280,130),(0,0,0),-1)
-# # # #     y0=30
-# # # #     for d in ['North','East','South','West']:
-# # # #         cv2.putText(overlay,f"{d}: Q={per_queues[d]} C={per_counts[d]}",(16,y0),cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,255,255),1)
-# # # #         y0+=22
-# # # #     cv2.putText(overlay,f"GREEN: {st.session_state.ctrl['current_green']} ({int(st.session_state.ctrl['remaining'])}s)",(16,y0+6),cv2.FONT_HERSHEY_SIMPLEX,0.55,(0,255,0),2)
-
-# # # #     video_box.image(cv2.cvtColor(overlay,cv2.COLOR_BGR2RGB),channels='RGB',width=720)
-
-# # # #     # Right-side UI
-# # # #     with col2:
-# # # #         st.markdown(draw_signal_html(st.session_state.ctrl['current_green']),unsafe_allow_html=True)
-# # # #         st.write("**Remaining (s)**:",int(st.session_state.ctrl['remaining']))
-# # # #         for d in ['North','East','South','West']:
-# # # #             st.metric(label=f"{d} queue",value=st.session_state.ctrl['queues'][d],delta=f"count {st.session_state.ctrl['counts'][d]}")
-# # # #         # chart
-# # # #         df_chart=[]
-# # # #         for d in ['North','East','South','West']:
-# # # #             for i,v in enumerate(st.session_state.ctrl['history'][d]):
-# # # #                 df_chart.append({'t':i,'queue':v,'dir':d})
-# # # #         if df_chart:
-# # # #             fig=px.line(df_chart,x='t',y='queue',color='dir',labels={'t':'time','queue':'queue length','dir':'direction'},height=240)
-# # # #             st.plotly_chart(fig,use_container_width=True)
-
-# # # #     # respect FPS
-# # # #     t_elapsed=time.time()-t_start
-# # # #     to_sleep=max(0,frame_interval-t_elapsed)
-# # # #     time.sleep(to_sleep)
-
-# # # # # cleanup
-# # # # cap.release()
-# # # # if tempfile_path and os.path.exists(tempfile_path):
-# # # #     os.remove(tempfile_path)
-# # # # st.success("Processing finished.")
-
-
-
-
-
-
-
-
-
-
-# # # # traffic_manager_complete.py
-# # # import os
-# # # import time
-# # # import tempfile
-# # # import threading
-# # # from collections import deque, OrderedDict
-
-# # # import cv2
-# # # import numpy as np
-# # # import streamlit as st
-
-# # # # YOLO detection
-# # # try:
-# # #     from ultralytics import YOLO
-# # #     HAS_ULTRALYTICS = True
-# # # except:
-# # #     HAS_ULTRALYTICS = False
-
-# # # # ------------------------------
-# # # # Centroid tracker
-# # # # ------------------------------
-# # # class CentroidTracker:
-# # #     def __init__(self, max_disappeared=30, max_distance=60):
-# # #         self.nextObjectID = 0
-# # #         self.objects = OrderedDict()
-# # #         self.disappeared = OrderedDict()
-# # #         self.max_disappeared = max_disappeared
-# # #         self.max_distance = max_distance
-# # #         self.history = {}
-
-# # #     def register(self, centroid, timestamp=None):
-# # #         oid = self.nextObjectID
-# # #         self.nextObjectID += 1
-# # #         self.objects[oid] = centroid
-# # #         self.disappeared[oid] = 0
-# # #         t = timestamp if timestamp else time.time()
-# # #         self.history[oid] = [(t, centroid)]
-# # #         return oid
-
-# # #     def deregister(self, oid):
-# # #         for d in [self.objects, self.disappeared, self.history]:
-# # #             if oid in d: del d[oid]
-
-# # #     def update(self, input_centroids, timestamp=None):
-# # #         timestamp = timestamp or time.time()
-# # #         if len(input_centroids) == 0:
-# # #             for oid in list(self.disappeared.keys()):
-# # #                 self.disappeared[oid] += 1
-# # #                 if self.disappeared[oid] > self.max_disappeared:
-# # #                     self.deregister(oid)
-# # #             return self.objects
-# # #         if len(self.objects) == 0:
-# # #             for c in input_centroids:
-# # #                 self.register(c, timestamp)
-# # #             return self.objects
-
-# # #         objectIDs = list(self.objects.keys())
-# # #         objectCentroids = list(self.objects.values())
-
-# # #         D = np.linalg.norm(np.array(objectCentroids)[:, None, :] - np.array(input_centroids)[None, :, :], axis=2)
-# # #         rows = D.min(axis=1).argsort()
-# # #         cols = D.argmin(axis=1)[rows]
-
-# # #         usedRows, usedCols = set(), set()
-# # #         for (r, c) in zip(rows, cols):
-# # #             if r in usedRows or c in usedCols: continue
-# # #             if D[r, c] > self.max_distance: continue
-# # #             oid = objectIDs[r]
-# # #             self.objects[oid] = tuple(input_centroids[c])
-# # #             self.disappeared[oid] = 0
-# # #             self.history[oid].append((timestamp, tuple(input_centroids[c])))
-# # #             usedRows.add(r)
-# # #             usedCols.add(c)
-
-# # #         for r in set(range(D.shape[0])) - usedRows:
-# # #             oid = objectIDs[r]
-# # #             self.disappeared[oid] += 1
-# # #             if self.disappeared[oid] > self.max_disappeared: self.deregister(oid)
-# # #         for c in set(range(D.shape[1])) - usedCols:
-# # #             self.register(tuple(input_centroids[c]), timestamp)
-# # #         return self.objects
-
-# # # # ------------------------------
-# # # # Detector: YOLO or background subtractor
-# # # # ------------------------------
-# # # class Detector:
-# # #     def __init__(self, yolo_weights=None, conf=0.25):
-# # #         self.conf = conf
-# # #         self.use_yolo = HAS_ULTRALYTICS and yolo_weights
-# # #         self.model = YOLO(yolo_weights) if self.use_yolo else None
-# # #         self.bg = cv2.createBackgroundSubtractorMOG2(history=400, varThreshold=25, detectShadows=True)
-
-# # #     def detect(self, frame):
-# # #         boxes_out = []
-# # #         h, w = frame.shape[:2]
-# # #         if self.use_yolo and self.model:
-# # #             try:
-# # #                 res = self.model(frame)[0]
-# # #                 for b in res.boxes:
-# # #                     xyxy = b.xyxy[0].cpu().numpy() if hasattr(b, "xyxy") else b.xyxy.cpu().numpy()
-# # #                     x1,y1,x2,y2 = map(int, xyxy[:4])
-# # #                     conf = float(b.conf[0]) if hasattr(b,"conf") else float(b.conf)
-# # #                     cls = int(b.cls[0]) if hasattr(b,"cls") else int(b.cls)
-# # #                     name = res.names[cls] if hasattr(res,"names") else str(cls)
-# # #                     if name in ('car','truck','bus','motorbike','motorcycle','person'):
-# # #                         boxes_out.append((x1,y1,x2,y2,name,conf))
-# # #                 return boxes_out
-# # #             except:
-# # #                 pass
-# # #         # fallback
-# # #         mask = self.bg.apply(frame)
-# # #         _, mask = cv2.threshold(mask,254,255,cv2.THRESH_BINARY)
-# # #         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(5,5))
-# # #         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-# # #         contours,_ = cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
-# # #         for cnt in contours:
-# # #             if cv2.contourArea(cnt)<800: continue
-# # #             x,y,w_,h_ = cv2.boundingRect(cnt)
-# # #             boxes_out.append((x,y,x+w_,y+h_,'vehicle',0.9))
-# # #         return boxes_out
-
-# # # def box_centroid(box):
-# # #     x1,y1,x2,y2 = box[:4]
-# # #     return (int((x1+x2)/2), int((y1+y2)/2))
-
-# # # # ------------------------------
-# # # # Traffic Management Functions
-# # # # ------------------------------
-# # # def compute_hybrid_score(queue_len, last_served_time, starvation_weight):
-# # #     waited = time.time() - last_served_time
-# # #     return queue_len + starvation_weight * waited
-
-# # # def compute_green_time(queue_len, min_green, max_green):
-# # #     base_time = 5
-# # #     raw = base_time * queue_len
-# # #     return max(min_green, min(max_green, raw))
-
-# # # # ------------------------------
-# # # # Streamlit UI
-# # # # ------------------------------
-# # # st.set_page_config(layout="wide", page_title="TrafficManagerAI")
-# # # st.title("🚦 TrafficManagerAI — Hybrid Traffic Controller")
-
-# # # # Sidebar controls
-# # # st.sidebar.header("Settings")
-# # # min_green = st.sidebar.number_input("Min green (s)", 5, 60, 8)
-# # # max_green = st.sidebar.number_input("Max green (s)", 10, 120, 30)
-# # # starvation_weight = st.sidebar.slider("Starvation weight", 0.0, 1.0, 0.5, 0.01)
-# # # strategy = st.sidebar.selectbox("Strategy", ["hybrid"])
-# # # uploaded = st.sidebar.file_uploader("Upload video", type=['mp4','avi','mov'])
-# # # use_sample = st.sidebar.checkbox("Use sample video", value=False)
-# # # yolo_weights = st.sidebar.text_input("YOLO weights path (optional)", "yolov11n.pt")
-
-# # # # Start / Stop buttons
-# # # start_btn = st.sidebar.button("Start Controller")
-# # # stop_btn = st.sidebar.button("Stop Controller")
-
-# # # # placeholders
-# # # video_box = st.empty()
-# # # signal_box = st.empty()
-
-# # # # Initialize session state
-# # # if 'ctrl' not in st.session_state:
-# # #     st.session_state.ctrl = {
-# # #         'running': False,
-# # #         'current_green': None,
-# # #         'remaining': 0,
-# # #         'last_switch': {d: time.time() for d in ['North','East','South','West']},
-# # #         'queues': {d:0 for d in ['North','East','South','West']},
-# # #     }
-
-# # # # Load video
-# # # video_path = None
-# # # cap = None
-# # # if uploaded:
-# # #     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-# # #     tmp.write(uploaded.getbuffer())
-# # #     tmp.close()
-# # #     video_path = tmp.name
-# # #     cap = cv2.VideoCapture(video_path)
-# # # elif use_sample:
-# # #     sample = "temp_video.mp4"
-# # #     if os.path.exists(sample):
-# # #         video_path = sample
-# # #         cap = cv2.VideoCapture(video_path)
-
-# # # if cap is None or not cap.isOpened():
-# # #     st.info("Upload a video or enable sample mode.")
-# # #     st.stop()
-
-# # # # Initialize detector and tracker
-# # # detector = Detector(yolo_weights if yolo_weights else None)
-# # # tracker = CentroidTracker(max_disappeared=30, max_distance=70)
-
-# # # # Start/stop controller
-# # # if start_btn:
-# # #     st.session_state.ctrl['running'] = True
-# # # if stop_btn:
-# # #     st.session_state.ctrl['running'] = False
-
-# # # fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-# # # frame_interval = 1.0 / max(1.0, fps)
-
-# # # # ------------------------------
-# # # # Main loop
-# # # # ------------------------------
-# # # while cap.isOpened():
-# # #     t_start = time.time()
-# # #     ret, frame = cap.read()
-# # #     if not ret: break
-# # #     h,w = frame.shape[:2]
-
-# # #     # Detect vehicles
-# # #     boxes = detector.detect(frame)
-# # #     centroids = [box_centroid(b) for b in boxes]
-# # #     objects = tracker.update(centroids, time.time())
-
-# # #     # Reset counts
-# # #     queues = {d:0 for d in ['North','East','South','West']}
-
-# # #     # Assign objects to directions
-# # #     for oid, centroid in objects.items():
-# # #         x,y = centroid
-# # #         dir_assigned = None
-# # #         # simple top-down quadrants
-# # #         if y < h*0.35: dir_assigned='North'
-# # #         elif y > h*0.65: dir_assigned='South'
-# # #         elif x < w*0.35: dir_assigned='West'
-# # #         elif x > w*0.65: dir_assigned='East'
-# # #         else: dir_assigned='North'
-# # #         queues[dir_assigned] +=1
-
-# # #         # Draw boxes with labels
-# # #         for box in boxes:
-# # #             x1,y1,x2,y2,label,_ = box
-# # #             cv2.rectangle(frame,(x1,y1),(x2,y2),(0,255,0),2)
-# # #             cv2.putText(frame,label,(x1,y1-5),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,255,255),1)
-
-# # #     st.session_state.ctrl['queues'] = queues
-
-# # #     # Controller logic
-# # #     if st.session_state.ctrl['running']:
-# # #         # Compute score with starvation
-# # #         scores = {}
-# # #         for d in ['North','East','South','West']:
-# # #             if queues[d]>0:
-# # #                 scores[d] = compute_hybrid_score(queues[d], st.session_state.ctrl['last_switch'][d], starvation_weight)
-# # #         if scores:
-# # #             next_dir = max(scores, key=scores.get)
-# # #             green_time = compute_green_time(queues[next_dir], min_green, max_green)
-# # #             if st.session_state.ctrl['current_green'] != next_dir or st.session_state.ctrl['remaining']<=0:
-# # #                 st.session_state.ctrl['current_green'] = next_dir
-# # #                 st.session_state.ctrl['remaining'] = green_time
-# # #                 st.session_state.ctrl['last_switch'][next_dir] = time.time()
-# # #         # Decrement remaining
-# # #         st.session_state.ctrl['remaining'] = max(0, st.session_state.ctrl['remaining'] - (time.time()-t_start))
-
-# # #     # Overlay traffic light info
-# # #     overlay = frame.copy()
-# # #     colors = {d:'gray' for d in ['North','East','South','West']}
-# # #     if st.session_state.ctrl['current_green']:
-# # #         colors[st.session_state.ctrl['current_green']] = 'green'
-# # #     for i,d in enumerate(['North','East','South','West']):
-# # #         cv2.rectangle(overlay,(10,10+i*30),(60,35+i*30),(0,0,0),-1)
-# # #         cv2.putText(overlay,f"{d}: {queues[d]}",(12,30+i*30),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,255,0) if colors[d]=='green' else (200,200,200),1)
-
-# # #     cv2.putText(overlay,f"GREEN: {st.session_state.ctrl['current_green']} ({int(st.session_state.ctrl['remaining'])}s)",(10,150),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,0),2)
-
-# # #     frame_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
-# # #     video_box.image(frame_rgb, channels='RGB', width=720)
-
-# # #     # Display traffic lights on right panel (once, no loops)
-# # #     with signal_box.container():
-# # #         st.markdown("### Traffic Lights")
-# # #         for d in ['North','East','South','West']:
-# # #             color = 'green' if st.session_state.ctrl['current_green']==d else 'gray'
-# # #             st.markdown(f"<div style='padding:8px; border-radius:8px; background-color:{color}; color:white; margin-bottom:4px;'>{d}</div>", unsafe_allow_html=True)
-# # #         st.markdown(f"**Remaining:** {int(st.session_state.ctrl['remaining'])} s")
-
-# # #     t_elapsed = time.time()-t_start
-# # #     time.sleep(max(0, frame_interval - t_elapsed))
-
-# # # cap.release()
-# # # st.success("Processing finished.")
-
-
-
-
-
-
-# # # traffic_manager_app.py
 # # import streamlit as st
 # # import cv2
-# # import numpy as np
 # # import tempfile
 # # import time
-# # import os
-# # from collections import deque
-# # import threading
-# # import requests
+# # from ultralytics import YOLO  # for vehicle detection
 
-# # # Try YOLO from ultralytics
-# # try:
-# #     from ultralytics import YOLO
-# #     HAS_YOLO = True
-# # except Exception:
-# #     HAS_YOLO = False
-
-# # # --------------------------
+# # # ----------------------------------------------------------------------
 # # # Streamlit setup
-# # # --------------------------
-# # st.set_page_config(layout="wide", page_title="TrafficManagerAI")
-# # st.title("🚦 TrafficManagerAI — Real-Time Traffic Manager")
+# # st.set_page_config(page_title="Smart Traffic Light – 90° Compass Grid", layout="wide")
+# # st.title("🚦 Smart Traffic Light with 90° Compass Grid")
 
-# # # --------------------------
-# # # Sidebar: Inputs & Controls
-# # # --------------------------
-# # uploaded = st.sidebar.file_uploader("Upload video (mp4/avi/mov)", type=['mp4','avi','mov','mkv'])
-# # use_sample = st.sidebar.checkbox("Use sample video (temp_video.mp4)")
-# # yolo_weights = st.sidebar.text_input("YOLO weights path (optional)", value="yolov8n.pt" if HAS_YOLO else "")
-# # min_green = st.sidebar.number_input("Min green (s)", 5, 60, 8)
-# # max_green = st.sidebar.number_input("Max green (s)", 5, 120, 20)
-# # starvation_weight = st.sidebar.slider("Starvation weight (0=no starvation)", 0.0, 2.0, 1.0, 0.01)
-# # strategy = st.sidebar.selectbox("Strategy", ["Proportional+Starvation"])
-# # enable_api = st.sidebar.checkbox("Enable API POST integration")
-# # api_url = st.sidebar.text_input("API endpoint", "http://127.0.0.1:5000/signal")
+# # uploaded_file = st.file_uploader("Upload a traffic video", type=["mp4","mov","avi","mkv"])
 
-# # start_btn = st.sidebar.button("Start Controller")
-# # stop_btn = st.sidebar.button("Stop Controller")
+# # # ----------------------------------------------------------------------
+# # # Helper: assign detected vehicles to North, South, East, West (quadrant-based)
+# # def get_sector(cx, cy, w, h):
+# #     if cy < h // 2 and abs(cx - w // 2) <= w // 4:   # top-middle → North
+# #         return "North"
+# #     elif cy >= h // 2 and abs(cx - w // 2) <= w // 4:  # bottom-middle → South
+# #         return "South"
+# #     elif cx < w // 2:   # left side → West
+# #         return "West"
+# #     else:               # right side → East
+# #         return "East"
+# # # ----------------------------------------------------------------------
 
-# # # --------------------------
-# # # Video setup
-# # # --------------------------
-# # video_path = None
-# # if uploaded:
-# #     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-# #     tmp.write(uploaded.getbuffer())
-# #     tmp.close()
-# #     video_path = tmp.name
-# # elif use_sample:
-# #     if os.path.exists("temp_video.mp4"):
-# #         video_path = "temp_video.mp4"
+# # if uploaded_file is not None:
+# #     # Save uploaded file to temp
+# #     tfile = tempfile.NamedTemporaryFile(delete=False)
+# #     tfile.write(uploaded_file.read())
+# #     cap = cv2.VideoCapture(tfile.name)
+
+# #     if not cap.isOpened():
+# #         st.error("❌ Could not open the uploaded video.")
 # #     else:
-# #         st.sidebar.error("No sample video found (temp_video.mp4)")
+# #         stframe = st.empty()
+
+# #         # Load YOLO model (better than nano)
+# #         model = YOLO("yolov8s.pt")  # try yolov8m.pt for even better accuracy
+
+# #         prev_green_side = None
+# #         green_counter = 0
+# #         STABLE_FRAMES = 3  # consecutive frames needed to switch
+
+# #         while cap.isOpened():
+# #             ret, frame = cap.read()
+# #             if not ret:
+# #                 break
+
+# #             h, w = frame.shape[:2]
+
+# #             # Run YOLO inference with tuned thresholds
+# #             results = model(frame, conf=0.1, iou=0.4, verbose=False)[0]
+
+# #             # Vehicle counts per sector
+# #             counts = {'North': 0, 'South': 0, 'East': 0, 'West': 0}
+
+# #             # Loop over detections
+# #             for box in results.boxes:
+# #                 cls_id = int(box.cls[0])
+# #                 conf = float(box.conf[0])
+# #                 x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+# #                 # Only consider vehicles (car=2, motorcycle=3, bus=5, truck=7)
+# #                 if cls_id in [2, 3, 5, 7]:
+# #                     cx = (x1 + x2) // 2
+# #                     cy = (y1 + y2) // 2
+# #                     sector = get_sector(cx, cy, w, h)
+# #                     counts[sector] += 1
+
+# #                     # Draw detection box
+# #                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+# #                     cv2.circle(frame, (cx, cy), 4, (0, 0, 255), -1)
+# #                     cv2.putText(frame, sector, (x1, y1 - 5),
+# #                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+# #             # Determine green side with stabilization
+# #             max_count = max(counts.values())
+# #             if max_count > 0:
+# #                 top_sides = [k for k, v in counts.items() if v == max_count]
+
+# #                 if len(top_sides) == 1:
+# #                     green_side = top_sides[0]
+# #                 else:
+# #                     # If tie, keep previous green if it’s part of the tie
+# #                     green_side = prev_green_side if prev_green_side in top_sides else top_sides[0]
+
+# #                 # Stabilize: only change after STABLE_FRAMES
+# #                 if green_side == prev_green_side:
+# #                     green_counter += 1
+# #                 else:
+# #                     green_counter = 1
+# #                     prev_green_side = green_side
+
+# #                 if green_counter < STABLE_FRAMES:
+# #                     green_side = prev_green_side
+# #             else:
+# #                 green_side = None
+
+# #             # Draw compass cross
+# #             cv2.line(frame, (w // 2, 0), (w // 2, h), (255, 0, 0), 2)
+# #             cv2.line(frame, (0, h // 2), (w, h // 2), (255, 0, 0), 2)
+# #             cv2.putText(frame, "N", (w // 2 - 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+# #             cv2.putText(frame, "S", (w // 2 - 10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+# #             cv2.putText(frame, "W", (10, h // 2 + 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+# #             cv2.putText(frame, "E", (w - 30, h // 2 + 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+# #             # Show green side
+# #             if green_side:
+# #                 cv2.putText(frame, f"Green Light: {green_side}", (20, h - 20),
+# #                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
+
+# #             # Streamlit display
+# #             stframe.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+# #                           channels="RGB",
+# #                           use_container_width=True)
+
+# #             # Slow down update to reduce flicker
+# #             time.sleep(0.2)  # ~5 FPS
+
+# #         cap.release()
+        
+        
+        
+
+
+
+
+
+
+# # # traffic_light_tunable.py
+# # import streamlit as st
+# # import cv2
+# # import tempfile
+# # import time
+# # from ultralytics import YOLO
+
+# # st.set_page_config(page_title="Smart Traffic Light – Tunable Detection", layout="wide")
+# # st.title("🚦 Smart Traffic Light — Tunable Vehicle Detection")
+
+# # # ----------------- Sidebar controls -----------------
+# # st.sidebar.header("Detection Settings")
+
+# # model_choice = st.sidebar.selectbox("YOLO model", ("yolov8n.pt", "yolov8s.pt", "yolov8m.pt"))
+# # conf_thresh = st.sidebar.slider("Detection Sensitivity (confidence) — lower = more detections",
+# #                                 min_value=0.01, max_value=0.9, value=0.10, step=0.01)
+# # iou_thresh = st.sidebar.slider("NMS IoU threshold", min_value=0.1, max_value=0.9, value=0.4, step=0.05)
+# # resize_width = st.sidebar.slider("Resize longer side to (px) — lower = faster, less detail",
+# #                                  min_value=320, max_value=1600, value=1280, step=32)
+# # min_box_area = st.sidebar.slider("Minimum box area (pixels) — ignore tiny detections",
+# #                                  min_value=100, max_value=50000, value=400, step=100)
+# # include_bicycle = st.sidebar.checkbox("Include bicycle in vehicle count (COCO class 1)", value=False)
+# # STABLE_FRAMES = st.sidebar.slider("Stabilization frames before switching green", 1, 12, 3)
+
+# # st.sidebar.markdown("---")
+# # st.sidebar.markdown("Tip: Lower confidence → more detections. Use bigger model for more accuracy.")
+# # # ----------------------------------------------------
+
+# # uploaded_file = st.file_uploader("Upload a traffic video", type=["mp4", "mov", "avi", "mkv"])
+
+# # # ----------------------------------------------------------------------
+# # # Helper: assign detected vehicles to North, South, East, West (quadrant-based)
+# # def get_sector(cx, cy, w, h):
+# #     # top-center region counts as North, bottom-center as South,
+# #     # left half as West, right half as East.
+# #     # Adjust the center-width threshold if you want a narrower/fatter center corridor.
+# #     center_tol = w // 4
+# #     if cy < h // 2 and abs(cx - w // 2) <= center_tol:
+# #         return "North"
+# #     elif cy >= h // 2 and abs(cx - w // 2) <= center_tol:
+# #         return "South"
+# #     elif cx < w // 2:
+# #         return "West"
+# #     else:
+# #         return "East"
+# # # ----------------------------------------------------------------------
+
+# # if uploaded_file is not None:
+# #     # save upload to temp file
+# #     tfile = tempfile.NamedTemporaryFile(delete=False)
+# #     tfile.write(uploaded_file.read())
+# #     cap = cv2.VideoCapture(tfile.name)
+
+# #     if not cap.isOpened():
+# #         st.error("❌ Could not open the uploaded video.")
 # #         st.stop()
-# # else:
-# #     st.info("Upload a video or enable sample mode")
-# #     st.stop()
 
-# # cap = cv2.VideoCapture(video_path)
-# # fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-# # frame_interval = 1.0 / fps
+# #     # load chosen YOLO model (will download if needed)
+# #     with st.spinner(f"Loading model {model_choice} ..."):
+# #         model = YOLO(model_choice)
 
-# # # --------------------------
-# # # YOLO Detector
-# # # --------------------------
-# # class Detector:
-# #     def __init__(self, weights=None, conf=0.25):
-# #         self.use_yolo = HAS_YOLO and weights
-# #         if self.use_yolo:
-# #             self.model = YOLO(weights)
+# #     stframe = st.empty()
+# #     info_area = st.empty()
+
+# #     prev_green_side = None
+# #     green_counter = 0
+
+# #     # Run through frames
+# #     while cap.isOpened():
+# #         ret, frame = cap.read()
+# #         if not ret:
+# #             break
+
+# #         orig_h, orig_w = frame.shape[:2]
+
+# #         # Resize frame if longer side > resize_width
+# #         max_side = max(orig_w, orig_h)
+# #         if max_side > resize_width:
+# #             scale = resize_width / float(max_side)
+# #             resized_w = int(orig_w * scale)
+# #             resized_h = int(orig_h * scale)
+# #             resized = cv2.resize(frame, (resized_w, resized_h))
 # #         else:
-# #             self.model = None
-# #         self.conf = conf
-# #         self.bg = cv2.createBackgroundSubtractorMOG2(history=400, varThreshold=25, detectShadows=True)
+# #             scale = 1.0
+# #             resized = frame.copy()
 
-# #     def detect(self, frame):
-# #         boxes = []
-# #         if self.use_yolo and self.model is not None:
+# #         # Run YOLO on resized frame with tuned thresholds
+# #         # conf -> confidence threshold; iou -> NMS IoU
+# #         results = model(resized, conf=conf_thresh, iou=iou_thresh, verbose=False)[0]
+
+# #         counts = {'North': 0, 'South': 0, 'East': 0, 'West': 0}
+# #         total_detected = 0
+
+# #         inv_scale = 1.0 / scale if scale != 0 else 1.0
+
+# #         # Loop over detections
+# #         for box in results.boxes:
 # #             try:
-# #                 res = self.model(frame)[0]
-# #                 for b in res.boxes:
-# #                     xyxy = b.xyxy[0].cpu().numpy() if hasattr(b, "xyxy") else b.xyxy.cpu().numpy()
-# #                     x1, y1, x2, y2 = map(int, xyxy[:4])
-# #                     conf = float(b.conf[0]) if hasattr(b, "conf") else float(b.conf)
-# #                     cls = int(b.cls[0]) if hasattr(b, "cls") else int(b.cls)
-# #                     name = res.names[cls] if hasattr(res, "names") else str(cls)
-# #                     if name in ('car','truck','bus','motorbike','motorcycle','person'):
-# #                         boxes.append((x1,y1,x2,y2,name,conf))
-# #                 return boxes
+# #                 cls_id = int(box.cls[0])
+# #                 conf = float(box.conf[0])
+# #                 x1r, y1r, x2r, y2r = map(float, box.xyxy[0])  # coords on resized frame
 # #             except Exception:
-# #                 pass
-# #         # fallback
-# #         mask = self.bg.apply(frame)
-# #         _, mask = cv2.threshold(mask,254,255,cv2.THRESH_BINARY)
-# #         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(5,5))
-# #         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,kernel,iterations=1)
-# #         contours,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-# #         for cnt in contours:
-# #             if cv2.contourArea(cnt)<800: continue
-# #             x,y,w_,h_ = cv2.boundingRect(cnt)
-# #             boxes.append((x,y,x+w_,y+h_,'vehicle',0.9))
-# #         return boxes
+# #                 # fallback if attributes differ
+# #                 coords = box.xyxy
+# #                 if len(coords) == 0:
+# #                     continue
+# #                 arr = coords[0]
+# #                 x1r, y1r, x2r, y2r = map(float, arr)
 
-# # detector = Detector(yolo_weights, conf=0.25)
+# #                 cls_id = int(box.cls) if hasattr(box, "cls") else None
+# #                 conf = float(box.conf) if hasattr(box, "conf") else 0.0
 
-# # # --------------------------
-# # # Session state for controller
-# # # --------------------------
-# # if "ctrl" not in st.session_state:
-# #     st.session_state.ctrl = {
-# #         "running": False,
-# #         "current_green": "North",
-# #         "remaining": 0,
-# #         "last_switch": time.time(),
-# #         "queues": {"North":0,"East":0,"South":0,"West":0},
-# #         "history": {"North":deque(maxlen=60),"East":deque(maxlen=60),
-# #                     "South":deque(maxlen=60),"West":deque(maxlen=60)}
-# #     }
+# #             # Map to original frame coordinates
+# #             x1 = int(x1r * inv_scale)
+# #             y1 = int(y1r * inv_scale)
+# #             x2 = int(x2r * inv_scale)
+# #             y2 = int(y2r * inv_scale)
 
-# # if start_btn:
-# #     st.session_state.ctrl['running'] = True
-# #     st.session_state.ctrl['remaining'] = 0
-# #     st.session_state.ctrl['last_switch'] = time.time()
+# #             # compute area on original frame
+# #             box_w = max(0, x2 - x1)
+# #             box_h = max(0, y2 - y1)
+# #             area = box_w * box_h
 
-# # if stop_btn:
-# #     st.session_state.ctrl['running'] = False
+# #             # optionally filter by area
+# #             if area < min_box_area:
+# #                 continue
 
-# # # --------------------------
-# # # Video & UI placeholders
-# # # --------------------------
-# # col1, col2 = st.columns([2,1])
-# # video_box = col1.empty()
-# # signal_box = col2.empty()
-# # chart_box = col2.empty()
+# #             # Only count vehicles: car=2, motorcycle=3, bus=5, truck=7 (+ bicycle=1 optional)
+# #             vehicle_classes = [2, 3, 5, 7]
+# #             if include_bicycle:
+# #                 vehicle_classes.append(1)
 
-# # # --------------------------
-# # # Helper functions
-# # # --------------------------
-# # def compute_green_alloc(queues):
-# #     total = sum(queues.values()) or 1
-# #     scores = {}
-# #     for k,v in queues.items():
-# #         # proportional + starvation
-# #         waited = time.time() - st.session_state.ctrl['last_switch']
-# #         score = v + starvation_weight * waited
-# #         scores[k] = score
-# #     next_dir = max(scores, key=scores.get)
-# #     green_time = int(min(max_green, max(min_green, queues[next_dir]*2)))
-# #     return next_dir, green_time
+# #             if cls_id in vehicle_classes:
+# #                 cx = int((x1 + x2) / 2)
+# #                 cy = int((y1 + y2) / 2)
+# #                 sector = get_sector(cx, cy, orig_w, orig_h)
+# #                 counts[sector] += 1
+# #                 total_detected += 1
 
-# # # --------------------------
-# # # Main processing loop (Streamlit-friendly)
-# # # --------------------------
-# # ret, frame = cap.read()
-# # if not ret:
-# #     st.success("Video finished")
+# #                 # draw box & label on original frame
+# #                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 255), 2)
+# #                 cv2.circle(frame, (cx, cy), 3, (0, 0, 255), -1)
+# #                 label = f"{sector} {conf:.2f}"
+# #                 cv2.putText(frame, label, (x1, max(0, y1 - 6)),
+# #                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
+
+# #         # Decide green side (the side with maximum vehicles)
+# #         max_count = max(counts.values())
+# #         if max_count > 0:
+# #             top_sides = [k for k, v in counts.items() if v == max_count]
+# #             if len(top_sides) == 1:
+# #                 green_side = top_sides[0]
+# #             else:
+# #                 # if tied, prefer previous green if in tie, else pick first
+# #                 green_side = prev_green_side if prev_green_side in top_sides else top_sides[0]
+
+# #             # stabilize across frames
+# #             if green_side == prev_green_side:
+# #                 green_counter += 1
+# #             else:
+# #                 green_counter = 1
+# #                 prev_green_side = green_side
+
+# #             if green_counter < STABLE_FRAMES:
+# #                 green_side = prev_green_side
+# #         else:
+# #             green_side = None
+
+# #         # Overlay counts & green side on frame
+# #         overlay_lines = [
+# #             f"Model: {model_choice}  Conf: {conf_thresh:.2f}  IoU: {iou_thresh:.2f}",
+# #             f"Resize max-side: {resize_width}px  Min box area: {min_box_area}px",
+# #             f"Detected vehicles (frame): {total_detected}",
+# #             f"Counts → N:{counts['North']}  S:{counts['South']}  E:{counts['East']}  W:{counts['West']}",
+# #             f"Green: {green_side if green_side else 'None'}"
+# #         ]
+
+# #         # draw overlay text
+# #         y0 = 20
+# #         for i, line in enumerate(overlay_lines):
+# #             cv2.putText(frame, line, (10, y0 + i * 20),
+# #                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+
+# #         # draw compass lines
+# #         cv2.line(frame, (orig_w // 2, 0), (orig_w // 2, orig_h), (255, 0, 0), 1)
+# #         cv2.line(frame, (0, orig_h // 2), (orig_w, orig_h // 2), (255, 0, 0), 1)
+# #         cv2.putText(frame, "N", (orig_w // 2 - 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+# #         cv2.putText(frame, "S", (orig_w // 2 - 10, orig_h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+# #         cv2.putText(frame, "W", (10, orig_h // 2 + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+# #         cv2.putText(frame, "E", (orig_w - 30, orig_h // 2 + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+# #         # show green side in green color
+# #         if green_side:
+# #             cv2.putText(frame, f"GREEN → {green_side}", (10, orig_h - 40),
+# #                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 3, cv2.LINE_AA)
+
+# #         # Streamlit update
+# #         stframe.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
+
+# #         # Info panel (below or to side)
+# #         info_area.markdown(
+# #             f"**Frame counts:** North={counts['North']}  •  South={counts['South']}  •  East={counts['East']}  •  West={counts['West']}\n\n"
+# #             f"**Detected this frame:** {total_detected}  •  **Green:** {green_side if green_side else 'None'}"
+# #         )
+
+# #         # small delay to reduce CPU usage & keep UI responsive
+# #         if cv2.waitKey(1) & 0xFF == ord('q'):
+# #             break
+# #         time.sleep(0.02)
+
 # #     cap.release()
-# #     st.stop()
-
-# # h,w = frame.shape[:2]
-
-# # # --- Detect vehicles ---
-# # boxes = detector.detect(frame)
-
-# # # --- Count vehicles per direction (simple zones) ---
-# # queues = {"North":0,"South":0,"East":0,"West":0}
-# # # Zones based on your top-down frame
-# # for box in boxes:
-# #     x1,y1,x2,y2,label,conf = box
-# #     cx, cy = int((x1+x2)/2), int((y1+y2)/2)
-    
-# #     if cy < h*0.4:
-# #         queues['North'] +=1
-# #     elif cy > h*0.6:
-# #         queues['South'] +=1
-    
-# #     if cx > w*0.6:
-# #         queues['East'] +=1
-# #     elif cx < w*0.4:
-# #         queues['West'] +=1
-
-
-# # st.session_state.ctrl['queues'] = queues
-# # for d in queues: st.session_state.ctrl['history'][d].append(queues[d])
-
-# # # --- Traffic controller ---
-# # if st.session_state.ctrl['running']:
-# #     if st.session_state.ctrl['remaining'] <=0:
-# #         next_dir, green_time = compute_green_alloc(queues)
-# #         st.session_state.ctrl['current_green'] = next_dir
-# #         st.session_state.ctrl['remaining'] = green_time
-# #         st.session_state.ctrl['last_switch'] = time.time()
-# #         # Send API if enabled
-# #         if enable_api:
-# #             def post_api():
-# #                 try:
-# #                     requests.post(api_url,json={"direction":next_dir,"action":"GREEN","duration":green_time})
-# #                 except: pass
-# #             threading.Thread(target=post_api,daemon=True).start()
-# #     else:
-# #         elapsed = time.time() - st.session_state.ctrl['last_switch']
-# #         st.session_state.ctrl['remaining'] = max(0, st.session_state.ctrl['remaining'] - elapsed)
-# #         st.session_state.ctrl['last_switch'] = time.time()
-
-# # # --- Overlay boxes ---
-# # overlay = frame.copy()
-# # for box in boxes:
-# #     x1,y1,x2,y2,label,conf = box
-# #     cv2.rectangle(overlay,(x1,y1),(x2,y2),(0,255,0),2)
-# #     cv2.putText(overlay,f"{label}",(x1,y1-5),cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,255,0),1)
-
-# # cv2.putText(overlay,f"GREEN: {st.session_state.ctrl['current_green']} ({int(st.session_state.ctrl['remaining'])}s)",
-# #             (10,30),cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,0),2)
-
-# # # --- Show video frame ---
-# # frame_rgb = cv2.cvtColor(overlay,cv2.COLOR_BGR2RGB)
-# # video_box.image(frame_rgb, channels='RGB', width=720)
-
-# # # --- Right-side traffic lights ---
-# # html = "<div style='display:flex;flex-direction:column;gap:8px;'>"
-# # for d in ['North','East','South','West']:
-# #     color = 'green' if st.session_state.ctrl['current_green']==d else 'gray'
-# #     html += f"<div style='display:flex;align-items:center;gap:6px;'>"
-# #     html += f"<div style='width:28px;height:28px;background:{color};border-radius:50%;'></div>"
-# #     html += f"<div><b>{d}</b></div></div>"
-# # html += "</div>"
-# # signal_box.markdown(html, unsafe_allow_html=True)
-
-# # # --- Small chart of queues ---
-# # import plotly.express as px
-# # df_chart = []
-# # for d in ['North','East','South','West']:
-# #     for i,v in enumerate(st.session_state.ctrl['history'][d]):
-# #         df_chart.append({'t':i,'queue':v,'dir':d})
-# # if df_chart:
-# #     fig = px.line(df_chart,x='t',y='queue',color='dir',labels={'t':'time','queue':'queue length','dir':'direction'},height=240)
-# #     chart_box.plotly_chart(fig,use_container_width=True)
-
-# # # --- Increment frame index for next rerun ---
-# # if "frame_idx" not in st.session_state: st.session_state.frame_idx = 0
-# # st.session_state.frame_idx +=1
-# # cap.set(cv2.CAP_PROP_POS_FRAMES, st.session_state.frame_idx)
-
-# # # Cleanup temp file if needed
-# # if uploaded:
-# #     try: os.remove(tmp.name)
-# #     except: pass
+# #     cv2.destroyAllWindows()
 
 
 
@@ -1183,274 +348,341 @@
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+# # traffic_light_simple.py
 # import streamlit as st
 # import cv2
-# import math
 # import tempfile
 # import time
+# from ultralytics import YOLO
 
-# st.set_page_config(page_title="Smart Traffic Light – 90° Compass Grid", layout="wide")
-# st.title("🚦 Smart Traffic Light with 90° Compass Grid")
+# st.set_page_config(page_title="Smart Traffic Light – Simple", layout="wide")
+# st.title("🚦 Smart Traffic Light — Vehicle Detection (Simple Mode)")
 
-# uploaded_file = st.file_uploader("Upload a traffic video", type=["mp4","mov","avi","mkv"])
+# # Sidebar: only 1 slider for sensitivity
+# st.sidebar.header("Detection Control")
+# conf_thresh = st.sidebar.slider("Detection Sensitivity — lower = more vehicles",
+#                                 min_value=0.01, max_value=0.9, value=0.15, step=0.01)
+# STABLE_FRAMES = 3  # keep green stable for a few frames
 
-# # ----------------------------------------------------------------------
-# # Helper to map a point (cx,cy) to a 90° compass sector.
+# uploaded_file = st.file_uploader("Upload a traffic video", type=["mp4", "mov", "avi", "mkv"])
+
+# # Assign detected vehicles to North, South, East, West
 # def get_sector(cx, cy, w, h):
-#     dx = cx - w/2
-#     dy = h/2 - cy   # invert Y so +y points upward
-#     angle = math.degrees(math.atan2(dy, dx))
-#     if angle < 0:
-#         angle += 360
-#     if 45 <= angle < 135:
-#         return 'North'
-#     elif 135 <= angle < 225:
-#         return 'West'
-#     elif 225 <= angle < 315:
-#         return 'South'
+#     center_tol = w // 4
+#     if cy < h // 2 and abs(cx - w // 2) <= center_tol:
+#         return "North"
+#     elif cy >= h // 2 and abs(cx - w // 2) <= center_tol:
+#         return "South"
+#     elif cx < w // 2:
+#         return "West"
 #     else:
-#         return 'East'
-# # ----------------------------------------------------------------------
+#         return "East"
 
 # if uploaded_file is not None:
+#     # Save upload
 #     tfile = tempfile.NamedTemporaryFile(delete=False)
 #     tfile.write(uploaded_file.read())
 #     cap = cv2.VideoCapture(tfile.name)
 
 #     if not cap.isOpened():
-#         st.error("❌ Could not open the uploaded video.")
-#     else:
-#         stframe = st.empty()
-#         fps = cap.get(cv2.CAP_PROP_FPS) or 25
+#         st.error("❌ Could not open video.")
+#         st.stop()
 
-#         prev_green_side = None
-#         green_counter = 0
-#         STABLE_FRAMES = 3  # number of consecutive frames to stabilize
+#     # Load a stronger model for better results
+#     with st.spinner("Loading YOLOv8s model..."):
+#         model = YOLO("yolov8s.pt")
 
-#         while cap.isOpened():
-#             ret, frame = cap.read()
-#             if not ret:
-#                 break
+#     stframe = st.empty()
+#     info_area = st.empty()
 
-#             h, w = frame.shape[:2]
+#     prev_green_side = None
+#     green_counter = 0
 
-#             # Dummy detections: Place one box in each compass sector
-#             dummy_boxes = [
-#                 (int(w*0.45), int(h*0.05), int(w*0.55), int(h*0.15)),  # North
-#                 (int(w*0.45), int(h*0.85), int(w*0.55), int(h*0.95)),  # South
-#                 (int(w*0.05), int(h*0.45), int(w*0.15), int(h*0.55)),  # West
-#                 (int(w*0.85), int(h*0.45), int(w*0.95), int(h*0.55))   # East
-#             ]
+#     while cap.isOpened():
+#         ret, frame = cap.read()
+#         if not ret:
+#             break
 
-#             counts = {'North':0, 'South':0, 'East':0, 'West':0}
+#         orig_h, orig_w = frame.shape[:2]
 
-#             for (x1,y1,x2,y2) in dummy_boxes:
-#                 cx = (x1 + x2)//2
-#                 cy = (y1 + y2)//2
-#                 sector = get_sector(cx, cy, w, h)
+#         # Resize automatically for speed/accuracy balance
+#         max_side = max(orig_w, orig_h)
+#         target_size = 1280
+#         scale = target_size / float(max_side) if max_side > target_size else 1.0
+#         if scale < 1.0:
+#             new_w = int(orig_w * scale)
+#             new_h = int(orig_h * scale)
+#             resized = cv2.resize(frame, (new_w, new_h))
+#         else:
+#             resized = frame.copy()
+
+#         results = model(resized, conf=conf_thresh, iou=0.45, verbose=False)[0]
+
+#         counts = {'North': 0, 'South': 0, 'East': 0, 'West': 0}
+#         total_detected = 0
+#         inv_scale = 1.0 / scale
+
+#         for box in results.boxes:
+#             cls_id = int(box.cls[0])
+#             x1r, y1r, x2r, y2r = map(float, box.xyxy[0])
+#             x1 = int(x1r * inv_scale)
+#             y1 = int(y1r * inv_scale)
+#             x2 = int(x2r * inv_scale)
+#             y2 = int(y2r * inv_scale)
+
+#             # Only vehicles: car=2, motorcycle=3, bus=5, truck=7
+#             if cls_id in [2, 3, 5, 7]:
+#                 cx = int((x1 + x2) / 2)
+#                 cy = int((y1 + y2) / 2)
+#                 sector = get_sector(cx, cy, orig_w, orig_h)
 #                 counts[sector] += 1
-#                 cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,255), 2)
-#                 cv2.circle(frame, (cx,cy), 4, (0,0,255), -1)
+#                 total_detected += 1
 
-#             # Determine green side with stabilization
-#             max_count = max(counts.values())
-#             if max_count > 0:
-#                 top_sides = [k for k,v in counts.items() if v == max_count]
+#                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 255), 2)
+#                 cv2.putText(frame, sector, (x1, max(0, y1 - 6)),
+#                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
 
-#                 if len(top_sides) == 1:
-#                     green_side = top_sides[0]
-#                 else:
-#                     # If tie, keep previous green if it’s part of the tie
-#                     green_side = prev_green_side if prev_green_side in top_sides else top_sides[0]
-
-#                 # Stabilize: only change after STABLE_FRAMES
-#                 if green_side == prev_green_side:
-#                     green_counter += 1
-#                 else:
-#                     green_counter = 1
-#                     prev_green_side = green_side
-
-#                 if green_counter < STABLE_FRAMES:
-#                     green_side = prev_green_side
+#         # Decide green side
+#         max_count = max(counts.values())
+#         if max_count > 0:
+#             top_sides = [k for k, v in counts.items() if v == max_count]
+#             if len(top_sides) == 1:
+#                 green_side = top_sides[0]
 #             else:
-#                 green_side = None
+#                 green_side = prev_green_side if prev_green_side in top_sides else top_sides[0]
 
-#             # Draw compass cross
-#             cv2.line(frame, (w//2,0),   (w//2,h),   (255,0,0), 2)
-#             cv2.line(frame, (0,h//2),   (w,h//2),   (255,0,0), 2)
-#             cv2.putText(frame, "N", (w//2-10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0),2)
-#             cv2.putText(frame, "S", (w//2-10,h-10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0),2)
-#             cv2.putText(frame, "W", (10,h//2+10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0),2)
-#             cv2.putText(frame, "E", (w-30,h//2+10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0),2)
+#             if green_side == prev_green_side:
+#                 green_counter += 1
+#             else:
+#                 green_counter = 1
+#                 prev_green_side = green_side
 
-#             if green_side:
-#                 cv2.putText(frame, f"Green Light: {green_side}", (20,h-20),
-#                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 3)
+#             if green_counter < STABLE_FRAMES:
+#                 green_side = prev_green_side
+#         else:
+#             green_side = None
 
-#             # Streamlit display
-#             stframe.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-#                           channels="RGB",
-#                           use_container_width=True)
+#         # Overlay info
+#         cv2.putText(frame, f"Detected: {total_detected}", (10, 20),
+#                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+#         cv2.putText(frame, f"Counts N:{counts['North']} S:{counts['South']} "
+#                            f"E:{counts['East']} W:{counts['West']}", (10, 45),
+#                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+#         if green_side:
+#             cv2.putText(frame, f"GREEN → {green_side}", (10, orig_h - 20),
+#                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 3)
 
-#             # Slow down update to reduce flicker
-#             time.sleep(0.2)  # 0.2s per frame → 5 FPS approx
+#         stframe.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
+#         info_area.markdown(f"**Detected vehicles:** {total_detected}  •  **Green:** {green_side or 'None'}")
 
-#         cap.release()
+#         if cv2.waitKey(1) & 0xFF == ord('q'):
+#             break
+#         time.sleep(0.02)
 
-
-
-
-
-
-
-
-
-
-
+#     cap.release()
+#     cv2.destroyAllWindows()
 
 
 
 
-
-
+# traffic_light_tunable_plus.py
 import streamlit as st
 import cv2
 import tempfile
 import time
-from ultralytics import YOLO  # for vehicle detection
+from ultralytics import YOLO
+from collections import defaultdict, deque
 
-st.set_page_config(page_title="Smart Traffic Light – 90° Compass Grid", layout="wide")
-st.title("🚦 Smart Traffic Light with 90° Compass Grid")
+# ----------------- Page Config -----------------
+st.set_page_config(page_title="🚦 Smart Traffic Light — Pro", layout="wide")
+st.title("🚦 Smart Traffic Light — Tunable & Smarter Detection")
 
-uploaded_file = st.file_uploader("Upload a traffic video", type=["mp4","mov","avi","mkv"])
+# ----------------- Sidebar controls -----------------
+st.sidebar.header("⚙️ Detection Settings")
 
-# ----------------------------------------------------------------------
-# Helper: assign detected vehicles to North, South, East, West (quadrant-based)
+model_choice = st.sidebar.selectbox("YOLO model", ("yolov8n.pt", "yolov8s.pt", "yolov8m.pt"))
+conf_thresh = st.sidebar.slider("Detection Sensitivity (confidence)", 0.01, 0.9, 0.10, 0.01)
+iou_thresh = st.sidebar.slider("NMS IoU threshold", 0.1, 0.9, 0.4, 0.05)
+resize_width = st.sidebar.slider("Resize longer side to (px)", 320, 1600, 960, 32)
+min_box_area = st.sidebar.slider("Minimum box area (pixels)", 100, 50000, 400, 100)
+
+# Vehicle selection
+vehicle_options = {"Car": 2, "Motorcycle": 3, "Bus": 5, "Truck": 7, "Bicycle": 1}
+selected_classes = st.sidebar.multiselect(
+    "Count these vehicle types:", list(vehicle_options.keys()), ["Car", "Bus", "Truck"]
+)
+selected_class_ids = [vehicle_options[v] for v in selected_classes]
+
+# Traffic light logic
+STABLE_FRAMES = st.sidebar.slider("Stabilization frames before switching", 1, 12, 3)
+MAX_GREEN_TIME = st.sidebar.slider("Max green time (sec)", 5, 30, 12)
+FRAME_SKIP = st.sidebar.slider("Skip frames (higher = faster)", 1, 5, 1)
+
+st.sidebar.markdown("---")
+st.sidebar.info("Tip: Lower confidence → more detections.\nUse bigger models for more accuracy.")
+
+# ----------------- File Upload -----------------
+uploaded_file = st.file_uploader("📹 Upload a traffic video", type=["mp4", "mov", "avi", "mkv"])
+
+# ----------------- Helper Functions -----------------
 def get_sector(cx, cy, w, h):
-    if cy < h // 2 and abs(cx - w // 2) <= w // 4:   # top-middle → North
+    """Assign detected vehicles to sectors (N, S, E, W)."""
+    center_tol = w // 4
+    if cy < h // 2 and abs(cx - w // 2) <= center_tol:
         return "North"
-    elif cy >= h // 2 and abs(cx - w // 2) <= w // 4:  # bottom-middle → South
+    elif cy >= h // 2 and abs(cx - w // 2) <= center_tol:
         return "South"
-    elif cx < w // 2:   # left side → West
+    elif cx < w // 2:
         return "West"
-    else:               # right side → East
+    else:
         return "East"
-# ----------------------------------------------------------------------
 
+# ----------------- Main -----------------
 if uploaded_file is not None:
+    # Save upload to temp file
     tfile = tempfile.NamedTemporaryFile(delete=False)
     tfile.write(uploaded_file.read())
     cap = cv2.VideoCapture(tfile.name)
 
     if not cap.isOpened():
         st.error("❌ Could not open the uploaded video.")
-    else:
+        st.stop()
+
+    with st.spinner(f"Loading YOLO model {model_choice} ..."):
+        model = YOLO(model_choice)
+
+    # Layout: Video left, Stats right
+    col1, col2 = st.columns([3, 1])
+    with col1:
         stframe = st.empty()
+    with col2:
+        st.subheader("📊 Live Stats")
+        north_m = st.metric("North", 0)
+        south_m = st.metric("South", 0)
+        east_m = st.metric("East", 0)
+        west_m = st.metric("West", 0)
+        green_display = st.empty()
+        total_display = st.empty()
 
-        # Load YOLO model (pretrained on COCO dataset)
-        model = YOLO("yolov8n.pt")  # you can use yolov8s.pt for better accuracy
+    # State vars
+    prev_green_side = None
+    green_counter = 0
+    green_timer_start = time.time()
+    green_counts = defaultdict(int)  # cumulative green lights given
+    total_detected_all = 0
+    round_robin = deque(["North", "East", "South", "West"])
 
-        prev_green_side = None
-        green_counter = 0
-        STABLE_FRAMES = 3  # consecutive frames needed to switch
+    frame_idx = 0
 
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-            h, w = frame.shape[:2]
+        frame_idx += 1
+        if frame_idx % FRAME_SKIP != 0:
+            continue
 
-            # Run YOLO inference
-            results = model(frame, verbose=False)[0]
+        orig_h, orig_w = frame.shape[:2]
 
-            counts = {'North': 0, 'South': 0, 'East': 0, 'West': 0}
+        # Resize if needed
+        max_side = max(orig_w, orig_h)
+        if max_side > resize_width:
+            scale = resize_width / float(max_side)
+            resized = cv2.resize(frame, (int(orig_w * scale), int(orig_h * scale)))
+        else:
+            scale = 1.0
+            resized = frame.copy()
+            scale = 1.0
+        inv_scale = 1.0 / scale
 
-            # Loop over detections
-            for box in results.boxes:
-                cls_id = int(box.cls[0])
-                conf = float(box.conf[0])
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
+        # Run YOLO
+        results = model(resized, conf=conf_thresh, iou=iou_thresh, verbose=False)[0]
 
-                # Only consider vehicles (car=2, motorcycle=3, bus=5, truck=7 in COCO)
-                if cls_id in [2, 3, 5, 7]:
-                    cx = (x1 + x2) // 2
-                    cy = (y1 + y2) // 2
-                    sector = get_sector(cx, cy, w, h)
-                    counts[sector] += 1
+        counts = {'North': 0, 'South': 0, 'East': 0, 'West': 0}
+        total_detected = 0
 
-                    # Draw detection box
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
-                    cv2.circle(frame, (cx, cy), 4, (0, 0, 255), -1)
-                    cv2.putText(frame, sector, (x1, y1 - 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        for box in results.boxes:
+            cls_id = int(box.cls[0])
+            if cls_id not in selected_class_ids:
+                continue
 
-            # Determine green side with stabilization
-            max_count = max(counts.values())
-            if max_count > 0:
-                top_sides = [k for k, v in counts.items() if v == max_count]
+            x1r, y1r, x2r, y2r = map(float, box.xyxy[0])
+            x1, y1, x2, y2 = map(int, [x1r * inv_scale, y1r * inv_scale, x2r * inv_scale, y2r * inv_scale])
 
-                if len(top_sides) == 1:
-                    green_side = top_sides[0]
-                else:
-                    # If tie, keep previous green if it’s part of the tie
-                    green_side = prev_green_side if prev_green_side in top_sides else top_sides[0]
+            box_w, box_h = x2 - x1, y2 - y1
+            if box_w * box_h < min_box_area:
+                continue
 
-                # Stabilize: only change after STABLE_FRAMES
-                if green_side == prev_green_side:
-                    green_counter += 1
-                else:
-                    green_counter = 1
-                    prev_green_side = green_side
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            sector = get_sector(cx, cy, orig_w, orig_h)
+            counts[sector] += 1
+            total_detected += 1
+            total_detected_all += 1
 
-                if green_counter < STABLE_FRAMES:
-                    green_side = prev_green_side
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 255), 2)
+            cv2.circle(frame, (cx, cy), 3, (0, 0, 255), -1)
+            cv2.putText(frame, sector, (x1, max(0, y1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+        # Decide green side
+        max_count = max(counts.values())
+        if max_count > 0:
+            top_sides = [k for k, v in counts.items() if v == max_count]
+
+            if len(top_sides) == 1:
+                green_side = top_sides[0]
             else:
-                green_side = None
+                # Use previous if in tie, else round robin
+                if prev_green_side in top_sides:
+                    green_side = prev_green_side
+                else:
+                    while round_robin[0] not in top_sides:
+                        round_robin.rotate(-1)
+                    green_side = round_robin[0]
+                    round_robin.rotate(-1)
 
-            # Draw compass cross
-            cv2.line(frame, (w // 2, 0), (w // 2, h), (255, 0, 0), 2)
-            cv2.line(frame, (0, h // 2), (w, h // 2), (255, 0, 0), 2)
-            cv2.putText(frame, "N", (w // 2 - 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(frame, "S", (w // 2 - 10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(frame, "W", (10, h // 2 + 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(frame, "E", (w - 30, h // 2 + 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            if green_side == prev_green_side:
+                green_counter += 1
+            else:
+                green_counter = 1
+                green_timer_start = time.time()
+                prev_green_side = green_side
 
-            # Show green side
-            if green_side:
-                cv2.putText(frame, f"Green Light: {green_side}", (20, h - 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
+            if green_counter < STABLE_FRAMES:
+                green_side = prev_green_side
 
-            # Streamlit display
-            stframe.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-                          channels="RGB",
-                          use_container_width=True)
+            # Check max green time
+            if time.time() - green_timer_start > MAX_GREEN_TIME:
+                round_robin.rotate(-1)
+                green_side = round_robin[0]
+                prev_green_side = green_side
+                green_timer_start = time.time()
+                green_counter = 1
 
-            # Slow down update to reduce flicker
-            time.sleep(0.2)  # ~5 FPS
+            green_counts[green_side] += 1
+        else:
+            green_side = None
 
-        cap.release()
+        # Overlay
+        cv2.putText(frame, f"Green: {green_side if green_side else 'None'}",
+                    (10, orig_h - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                    (0, 255, 0) if green_side else (0, 0, 255), 3)
 
-        
-        
-        
-        
-        
-        
-        
-        
-        
+        stframe.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
+
+        # Update metrics
+        north_m.metric("North", counts["North"])
+        south_m.metric("South", counts["South"])
+        east_m.metric("East", counts["East"])
+        west_m.metric("West", counts["West"])
+
+        if green_side:
+            green_display.success(f"🟢 GREEN → *{green_side}* (active {int(time.time() - green_timer_start)}s)")
+        total_display.info(f"🔎 Total detected so far: {total_detected_all} | "
+                           f"Greens: {dict(green_counts)}")
+
+        time.sleep(0.02)
+
+    cap.release()
+    cv2.destroyAllWindows()        
