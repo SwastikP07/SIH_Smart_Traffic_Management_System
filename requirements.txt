@@ -19,3 +19,4 @@ numpy
 seaborn
 matplotlib
 requests
+opencv-python-headless
