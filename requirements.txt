@@ -1,0 +1,21 @@
+# streamlit
+# opencv-python
+# ultralytics
+# numpy
+
+
+
+
+
+streamlit
+opencv-python
+opencv-contrib-python
+ultralytics
+torch
+torchvision
+torchaudio
+pandas
+numpy
+seaborn
+matplotlib
+requests

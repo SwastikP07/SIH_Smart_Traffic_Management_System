@@ -1,0 +1,87 @@
+import streamlit as st
+import cv2, os, time, tempfile, json
+from ultralytics import YOLO
+from predictor import load_yolo_model, process_frame
+
+st.set_page_config(layout='wide', page_title='TrafficManagementAI - Improved (Integrated)')
+st.title('TrafficManagementAI — Improved (Integrated with your dataset)')
+
+st.sidebar.header('Inputs')
+uploaded = st.sidebar.file_uploader('Upload video file (optional)', type=['mp4','avi','mov'])
+use_sample = st.sidebar.checkbox('Use sample video included', value=False)
+model_path = st.sidebar.text_input('YOLO weights path', value='yolov11n.pt')
+conf = st.sidebar.slider('YOLO confidence', 0.01, 1.0, 0.25)
+min_green = st.sidebar.number_input('Minimum green (secs)', value=10, min_value=5)
+max_green = st.sidebar.number_input('Maximum green (secs)', value=60, min_value=10)
+
+# Historical averages from provided dataset
+avg_counts = json.loads(r'''{"North": 191.79503367003366, "East": 180.03880321067822, "South": 148.81875676406926, "West": 131.5105744949495}''')
+st.sidebar.markdown('---')
+st.sidebar.markdown('Historical average vehicle counts (from dataset):')
+for k,v in avg_counts.items():
+    st.sidebar.write(f"- {k}: {v:.1f} vehicles (avg)")
+
+# Suggest baseline green times proportional to historical averages
+total = sum(avg_counts.values()) or 1.0
+baseline = {{k: int(min(max_green, max(min_green, round((v/total)*(min_green+max_green))))) for k,v in avg_counts.items()}}
+
+st.sidebar.markdown('---')
+st.sidebar.markdown('Baseline suggested green times (from historical averages):')
+for k,v in baseline.items():
+    st.sidebar.write(f"- {k}: {v} s")
+
+# Load model
+@st.cache_resource
+def load_model(path):
+    try:
+        from predictor import load_yolo_model
+        model = load_yolo_model(path)
+        return model
+    except Exception as e:
+        st.error(f'Error loading model: {e}')
+        return None
+
+model = load_model(model_path)
+
+if uploaded is None and not use_sample:
+    st.info('Upload a video or enable "Use sample video included"')
+else:
+    video_path = None
+    if uploaded is not None:
+        tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+        tfile.write(uploaded.getbuffer())
+        video_path = tfile.name
+    elif use_sample:
+        sample = 'temp_video.mp4'
+        if os.path.exists(sample):
+            video_path = sample
+        else:
+            st.error('No sample video found in project folder. Upload your own.')
+    if video_path and model is not None:
+        st.info('Processing video — detections will use your provided YOLO weights.')
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) if cap.get(cv2.CAP_PROP_FPS)>0 else 25.0
+        stframe = st.empty()
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            try:
+                counts, annotated = process_frame(frame, model, conf=conf, annotate=True)
+            except Exception as e:
+                st.error(f'Error during frame processing: {e}')
+                break
+            # overlay baseline green times
+            y0 = 30
+            for k,v in baseline.items():
+                cv2.putText(annotated, f'Baseline {k} green: {v}s', (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+                y0 += 25
+            # show counts summary on frame
+            summary = f"Cars:{counts.get('car',0)} Trucks:{counts.get('truck',0)} Bikes:{counts.get('motorbike',0)} Buses:{counts.get('bus',0)}"
+            cv2.putText(annotated, summary, (10, y0+10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+            stframe.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), channels='RGB', use_column_width=True)
+            time.sleep(1.0/max(1.0, fps))
+        cap.release()
+        if uploaded is not None:
+            os.remove(video_path)
+        st.success('Processing finished.')
